@@ -1,0 +1,9 @@
+src/
+**/*.test.ts
+*.config.ts
+tsconfig.json
+biome.json
+.github/
+.gitignore
+docs/
+examples/

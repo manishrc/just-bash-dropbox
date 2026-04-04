@@ -1,0 +1,62 @@
+{
+  "name": "just-bash-dropbox",
+  "version": "0.1.0",
+  "description": "Dropbox filesystem adapter for just-bash",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/manishrc/just-bash-dropbox.git"
+  },
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist/",
+    "README.md",
+    "AGENTS.md"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "build": "rm -rf dist && tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest",
+    "test:run": "vitest run",
+    "lint": "biome check .",
+    "lint:fix": "biome check --write .",
+    "validate": "biome check . && tsc --noEmit && vitest run && rm -rf dist && tsc",
+    "prepublishOnly": "npm run validate"
+  },
+  "keywords": [
+    "dropbox",
+    "bash",
+    "filesystem",
+    "ai-agent",
+    "just-bash"
+  ],
+  "author": "",
+  "license": "Apache-2.0",
+  "devDependencies": {
+    "@biomejs/biome": "^2.3.10",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.9.3",
+    "vitest": "^4.0.16"
+  },
+  "peerDependencies": {
+    "just-bash": ">=2.0.0"
+  },
+  "peerDependenciesMeta": {
+    "just-bash": {
+      "optional": true
+    }
+  }
+}
