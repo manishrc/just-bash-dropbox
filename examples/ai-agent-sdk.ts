@@ -13,8 +13,8 @@
  */
 
 import { generateText, stepCountIs, tool } from "ai";
-import { DropboxFs } from "just-bash-dropbox";
 import { Bash } from "just-bash";
+import { DropboxFs } from "just-bash-dropbox";
 import { z } from "zod";
 
 // --- Setup ---

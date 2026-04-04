@@ -15,8 +15,8 @@
 
 import * as readline from "node:readline/promises";
 import { type ModelMessage, stepCountIs, streamText, tool } from "ai";
-import { DropboxFs } from "just-bash-dropbox";
 import { Bash } from "just-bash";
+import { DropboxFs } from "just-bash-dropbox";
 import { z } from "zod";
 
 // --- Setup ---

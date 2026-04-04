@@ -11,8 +11,8 @@
  *     npx tsx examples/token-provider.ts
  */
 
-import { DropboxFs } from "just-bash-dropbox";
 import { Bash } from "just-bash";
+import { DropboxFs } from "just-bash-dropbox";
 
 // Simple token cache with auto-refresh
 function createTokenProvider(config: {

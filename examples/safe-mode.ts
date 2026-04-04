@@ -12,8 +12,9 @@
  * Usage:
  *   DROPBOX_TOKEN=sl.xxx npx tsx examples/safe-mode.ts
  */
-import { DropboxFs } from "just-bash-dropbox";
+
 import { Bash, MountableFs } from "just-bash";
+import { DropboxFs } from "just-bash-dropbox";
 
 const token = process.env.DROPBOX_TOKEN;
 if (!token) {
