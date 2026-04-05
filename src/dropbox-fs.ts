@@ -1,5 +1,12 @@
+import type {
+  CpOptions,
+  FileContent,
+  FsStat,
+  MkdirOptions,
+  RmOptions,
+} from "just-bash";
 import { DropboxApiError, DropboxClient } from "./dropbox-client.js";
-import { enosys, FsError, mapDropboxError } from "./errors.js";
+import { eisdir, enosys, FsError, mapDropboxError } from "./errors.js";
 import { resolvePath as resolvePathUtil, toDropboxPath } from "./paths.js";
 import type {
   DropboxFsOptions,
@@ -7,33 +14,12 @@ import type {
   DropboxMetadata,
 } from "./types.js";
 
-interface FsStat {
-  isFile: boolean;
-  isDirectory: boolean;
-  isSymbolicLink: boolean;
-  mode: number;
-  size: number;
-  mtime: Date;
-}
-
+// Types not exported from just-bash's main entry but needed for IFileSystem
 interface DirentEntry {
   name: string;
   isFile: boolean;
   isDirectory: boolean;
   isSymbolicLink: boolean;
-}
-
-interface MkdirOptions {
-  recursive?: boolean;
-}
-
-interface RmOptions {
-  recursive?: boolean;
-  force?: boolean;
-}
-
-interface CpOptions {
-  recursive?: boolean;
 }
 
 interface ReadFileOptions {
@@ -44,11 +30,10 @@ interface WriteFileOptions {
   encoding?: string;
 }
 
-type FileContent = string | Uint8Array;
-
 export class DropboxFs {
   private readonly client: DropboxClient;
   private readonly rootPath: string | undefined;
+  private cachedPaths: string[] = [];
 
   constructor(options: DropboxFsOptions) {
     this.client = new DropboxClient({
@@ -167,16 +152,29 @@ export class DropboxFs {
     content: FileContent,
     _options?: WriteFileOptions | string,
   ): Promise<void> {
+    const dbxPath = this.toPath(path);
+
+    // Download existing file with metadata (to get rev for optimistic locking)
     let existing: Uint8Array;
+    let rev: string | undefined;
     try {
-      existing = await this.readFileBuffer(path);
+      const result = await this.client.contentDownload("/2/files/download", {
+        path: dbxPath,
+      });
+      existing = result.content;
+      rev = (result.metadata as Record<string, unknown>).rev as
+        | string
+        | undefined;
     } catch (err) {
-      if (err instanceof Error && "code" in err && err.code === "ENOENT") {
+      if (
+        err instanceof DropboxApiError &&
+        err.errorSummary.startsWith("path/not_found")
+      ) {
         // File doesn't exist — create it
         await this.writeFile(path, content);
         return;
       }
-      throw err;
+      throw mapDropboxError(err, path);
     }
 
     const appendBytes =
@@ -186,7 +184,20 @@ export class DropboxFs {
     combined.set(existing, 0);
     combined.set(appendBytes, existing.length);
 
-    await this.writeFile(path, combined);
+    // Upload with rev-based optimistic locking to detect concurrent writes
+    const mode = rev
+      ? { ".tag": "update", update: rev }
+      : ("overwrite" as const);
+
+    try {
+      await this.client.contentUpload(
+        "/2/files/upload",
+        { path: dbxPath, mode, autorename: false, mute: true },
+        combined,
+      );
+    } catch (err) {
+      throw mapDropboxError(err, path);
+    }
   }
 
   async mkdir(path: string, options?: MkdirOptions): Promise<void> {
@@ -206,6 +217,19 @@ export class DropboxFs {
 
   async rm(path: string, options?: RmOptions): Promise<void> {
     const dbxPath = this.toPath(path);
+
+    // POSIX: rm without -r on a directory should fail
+    if (!options?.recursive) {
+      try {
+        const s = await this.stat(path);
+        if (s.isDirectory) {
+          throw eisdir(path);
+        }
+      } catch (err) {
+        if (err instanceof FsError && err.code === "EISDIR") throw err;
+        // If stat fails (e.g. ENOENT), let delete_v2 handle it below
+      }
+    }
 
     try {
       await this.client.rpc("/2/files/delete_v2", { path: dbxPath });
@@ -256,7 +280,43 @@ export class DropboxFs {
   }
 
   getAllPaths(): string[] {
-    return [];
+    return this.cachedPaths;
+  }
+
+  /**
+   * Prefetch all file and folder paths via recursive list_folder.
+   * Call this before operations that need getAllPaths() (like glob).
+   * Results are cached until the next call to prefetchAllPaths().
+   */
+  async prefetchAllPaths(): Promise<string[]> {
+    const dbxPath = this.toPath("/");
+    const allPaths: string[] = [];
+
+    try {
+      let result = await this.client.rpc<DropboxListFolderResult>(
+        "/2/files/list_folder",
+        { path: dbxPath, recursive: true, include_deleted: false },
+      );
+
+      for (const entry of result.entries) {
+        allPaths.push(entry.path_display);
+      }
+
+      while (result.has_more) {
+        result = await this.client.rpc<DropboxListFolderResult>(
+          "/2/files/list_folder/continue",
+          { cursor: result.cursor },
+        );
+        for (const entry of result.entries) {
+          allPaths.push(entry.path_display);
+        }
+      }
+    } catch (err) {
+      throw mapDropboxError(err, "/");
+    }
+
+    this.cachedPaths = allPaths;
+    return allPaths;
   }
 
   // ─── Unsupported operations ─────────────────────────
@@ -277,12 +337,27 @@ export class DropboxFs {
     throw enosys("readlink");
   }
 
-  async lstat(_path: string): Promise<FsStat> {
-    throw enosys("lstat");
+  async lstat(path: string): Promise<FsStat> {
+    // Dropbox has no symlinks — lstat is identical to stat
+    return this.stat(path);
   }
 
-  async realpath(_path: string): Promise<string> {
-    throw enosys("realpath");
+  async realpath(path: string): Promise<string> {
+    const dbxPath = this.toPath(path);
+    // Root has no metadata endpoint
+    if (dbxPath === "" || dbxPath === "/") {
+      return "/";
+    }
+    try {
+      const metadata = await this.client.rpc<DropboxMetadata>(
+        "/2/files/get_metadata",
+        { path: dbxPath },
+      );
+      // Return canonical casing from Dropbox
+      return metadata.path_display;
+    } catch (err) {
+      throw mapDropboxError(err, path);
+    }
   }
 
   async utimes(_path: string, _atime: Date, _mtime: Date): Promise<void> {
@@ -362,7 +437,7 @@ function metadataToStat(metadata: DropboxMetadata): FsStat {
         isSymbolicLink: false,
         mode: 0o755,
         size: 0,
-        mtime: new Date(),
+        mtime: new Date(0),
       };
     case "deleted":
       throw new FsError("ENOENT", "no such file or directory (deleted)");

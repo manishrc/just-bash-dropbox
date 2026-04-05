@@ -260,6 +260,7 @@ describe("stat", () => {
     expect(s.isDirectory).toBe(true);
     expect(s.size).toBe(0);
     expect(s.mode).toBe(0o755);
+    expect(s.mtime).toEqual(new Date(0)); // deterministic, not Date.now()
   });
 
   it("returns synthetic stat for root path without API call", async () => {
@@ -362,12 +363,13 @@ describe("writeFile", () => {
 // ─── appendFile ──────────────────────────────────────────
 
 describe("appendFile", () => {
-  it("downloads existing content, appends, and re-uploads", async () => {
-    // First: download existing file
+  it("downloads existing content, appends, and re-uploads with rev", async () => {
+    // First: download existing file (includes rev in metadata)
     mockDownloadResponse("existing ", {
       ".tag": "file",
       name: "log.txt",
       size: 9,
+      rev: "abc123",
     });
     // Second: upload combined content
     mockRpcResponse({ ".tag": "file", name: "log.txt", id: "id:1", size: 18 });
@@ -376,8 +378,11 @@ describe("appendFile", () => {
     await fs.appendFile("/log.txt", "new data");
 
     expect(mockFetch).toHaveBeenCalledTimes(2);
-    // Second call should be upload
-    expect(mockFetch.mock.calls[1][0]).toContain("/2/files/upload");
+    // Second call should be upload with rev-based mode
+    const uploadApiArg = JSON.parse(
+      mockFetch.mock.calls[1][1].headers["Dropbox-API-Arg"],
+    );
+    expect(uploadApiArg.mode).toEqual({ ".tag": "update", update: "abc123" });
   });
 
   it("creates file if it does not exist", async () => {
@@ -450,6 +455,15 @@ describe("mkdir", () => {
 
 describe("rm", () => {
   it("deletes a file", async () => {
+    // stat check (file, not directory)
+    mockRpcResponse({
+      ".tag": "file",
+      name: "trash.txt",
+      id: "id:1",
+      size: 0,
+      server_modified: "2025-01-01T00:00:00Z",
+    });
+    // delete call
     mockRpcResponse({
       metadata: { ".tag": "file", name: "trash.txt", id: "id:1" },
     });
@@ -458,10 +472,35 @@ describe("rm", () => {
     await fs.rm("/trash.txt");
 
     expect(lastFetchUrl()).toContain("/2/files/delete_v2");
-    expect(lastFetchBody().path).toBe("/trash.txt");
+  });
+
+  it("throws EISDIR when deleting directory without recursive", async () => {
+    // stat returns folder
+    mockRpcResponse({
+      ".tag": "folder",
+      name: "my-dir",
+      id: "id:1",
+    });
+
+    const fs = createFs();
+    await expect(fs.rm("/my-dir")).rejects.toThrow("EISDIR");
+  });
+
+  it("deletes directory with recursive option", async () => {
+    mockRpcResponse({
+      metadata: { ".tag": "folder", name: "my-dir", id: "id:1" },
+    });
+
+    const fs = createFs();
+    await fs.rm("/my-dir", { recursive: true });
+
+    expect(lastFetchUrl()).toContain("/2/files/delete_v2");
   });
 
   it("throws ENOENT when file not found (without force)", async () => {
+    // stat fails with not_found
+    mock409("path/not_found/");
+    // delete also fails
     mock409("path_lookup/not_found/");
 
     const fs = createFs();
@@ -469,6 +508,9 @@ describe("rm", () => {
   });
 
   it("does not throw when file not found with force option", async () => {
+    // stat fails (ENOENT falls through)
+    mock409("path/not_found/");
+    // delete also fails with not_found
     mock409("path_lookup/not_found/");
 
     const fs = createFs();
@@ -574,14 +616,52 @@ describe("unsupported operations", () => {
     await expect(fs.readlink("/link")).rejects.toThrow("ENOSYS");
   });
 
-  it("lstat throws ENOSYS", async () => {
+  it("lstat delegates to stat (no symlinks on Dropbox)", async () => {
+    mockRpcResponse({
+      ".tag": "file",
+      name: "file.txt",
+      id: "id:1",
+      size: 100,
+      server_modified: "2025-01-01T00:00:00Z",
+    });
+
     const fs = createFs();
-    await expect(fs.lstat("/file")).rejects.toThrow("ENOSYS");
+    const s = await fs.lstat("/file.txt");
+
+    expect(s.isFile).toBe(true);
+    expect(s.size).toBe(100);
   });
 
-  it("realpath throws ENOSYS", async () => {
+  it("realpath verifies path exists and returns canonical casing", async () => {
+    mockRpcResponse({
+      ".tag": "file",
+      name: "README.md",
+      id: "id:1",
+      path_display: "/Documents/README.md",
+      path_lower: "/documents/readme.md",
+      size: 100,
+      server_modified: "2025-01-01T00:00:00Z",
+    });
+
     const fs = createFs();
-    await expect(fs.realpath("/file")).rejects.toThrow("ENOSYS");
+    const p = await fs.realpath("/documents/readme.md");
+
+    expect(p).toBe("/Documents/README.md");
+  });
+
+  it("realpath throws ENOENT for missing path", async () => {
+    mock409("path/not_found/");
+
+    const fs = createFs();
+    await expect(fs.realpath("/missing")).rejects.toThrow("ENOENT");
+  });
+
+  it("realpath returns / for root", async () => {
+    const fs = createFs();
+    const p = await fs.realpath("/");
+
+    expect(p).toBe("/");
+    expect(mockFetch).not.toHaveBeenCalled();
   });
 
   it("utimes throws ENOSYS", async () => {
@@ -595,9 +675,54 @@ describe("unsupported operations", () => {
 // ─── getAllPaths ──────────────────────────────────────────
 
 describe("getAllPaths", () => {
-  it("returns empty array (not supported for remote fs)", () => {
+  it("returns empty array (sync method cannot do async API calls)", () => {
     const fs = createFs();
     expect(fs.getAllPaths()).toEqual([]);
+  });
+
+  it("returns cached paths after prefetch", async () => {
+    mockRpcResponse({
+      entries: [
+        {
+          ".tag": "file",
+          name: "a.txt",
+          id: "id:1",
+          path_display: "/a.txt",
+          path_lower: "/a.txt",
+        },
+        {
+          ".tag": "folder",
+          name: "docs",
+          id: "id:2",
+          path_display: "/docs",
+          path_lower: "/docs",
+        },
+      ],
+      cursor: "c1",
+      has_more: true,
+    });
+    mockRpcResponse({
+      entries: [
+        {
+          ".tag": "file",
+          name: "b.md",
+          id: "id:3",
+          path_display: "/docs/b.md",
+          path_lower: "/docs/b.md",
+        },
+      ],
+      cursor: "c2",
+      has_more: false,
+    });
+
+    const fs = createFs();
+    await fs.prefetchAllPaths();
+
+    const paths = fs.getAllPaths();
+    expect(paths).toContain("/a.txt");
+    expect(paths).toContain("/docs");
+    expect(paths).toContain("/docs/b.md");
+    expect(paths).toHaveLength(3);
   });
 });
 

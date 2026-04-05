@@ -49,6 +49,7 @@
     "@biomejs/biome": "^2.3.10",
     "@types/node": "^22.0.0",
     "typescript": "^5.9.3",
+    "just-bash": "^2.14.0",
     "vitest": "^4.0.16"
   },
   "peerDependencies": {

@@ -107,21 +107,37 @@ rm -r /path/dir                   # delete directory
 mkdir -p /path/deep/nested        # create nested directories
 ```
 
+### Semantic notes
+
+- `lstat` delegates to `stat` (Dropbox has no symlinks)
+- `realpath` verifies the path exists and returns Dropbox's canonical casing
+- `rm /dir` (without `-r`) throws `EISDIR` — matches POSIX behavior
+- `>>` (append) uses optimistic locking via Dropbox's `rev` field to detect concurrent writes
+
 ### Not supported
 
-Dropbox doesn't have these concepts. These operations throw `ENOSYS`:
+These operations throw `ENOSYS`:
 
 - `chmod` — no file permissions
 - `ln` / `ln -s` — no hard/symbolic links
-- `readlink`, `realpath` — no symlinks to resolve
+- `readlink` — no symlinks
+- `utimes` — Dropbox manages timestamps
+
+### Glob support
+
+`getAllPaths()` returns `[]` by default (sync method can't make API calls). For glob support, call `prefetchAllPaths()` first:
+
+```ts
+await fs.prefetchAllPaths(); // recursive listing, cached
+fs.getAllPaths(); // returns all paths
+```
 
 ### Limitations
 
 - **File size**: Single uploads are limited to 150 MB
-- **Append**: `>>` works but downloads the entire file, appends, and re-uploads
+- **Append**: `>>` downloads the file, appends, re-uploads with rev-based conflict detection
 - **Case sensitivity**: Dropbox paths are case-insensitive (`/README.md` and `/readme.md` are the same file)
 - **Rate limits**: Handled automatically with retry + backoff; heavy usage may still hit Dropbox's per-user limits
-- **No glob via `getAllPaths`**: Returns `[]` — glob matching works through `readdir` + `stat` instead
 
 ## Error handling
 
@@ -134,6 +150,9 @@ Errors are mapped to errno-style codes for natural bash output:
 | `path/not_file` | `EISDIR` | Expected file, got directory |
 | `path/not_folder` | `ENOTDIR` | Expected directory, got file |
 | `insufficient_quota` | `ENOSPC` | Dropbox quota exceeded |
+| HTTP 401 | `EACCES` | Token expired or invalid |
+| HTTP 403 | `EACCES` | Insufficient app permissions |
+| `rm /dir` (no `-r`) | `EISDIR` | Use `rm -r` to delete directories |
 
 ```ts
 import { FsError } from "just-bash-dropbox";
