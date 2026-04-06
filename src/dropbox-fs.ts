@@ -7,6 +7,7 @@ import type {
 } from "just-bash";
 import { DropboxApiError, DropboxClient } from "./dropbox-client.js";
 import { eisdir, enosys, FsError, mapDropboxError } from "./errors.js";
+import { PathIndex } from "./path-index.js";
 import { resolvePath as resolvePathUtil, toDropboxPath } from "./paths.js";
 import type {
   DropboxFsOptions,
@@ -33,7 +34,7 @@ interface WriteFileOptions {
 export class DropboxFs {
   private readonly client: DropboxClient;
   private readonly rootPath: string | undefined;
-  private cachedPaths: string[] = [];
+  private readonly pathIndex = new PathIndex();
 
   constructor(options: DropboxFsOptions) {
     this.client = new DropboxClient({
@@ -142,6 +143,7 @@ export class DropboxFs {
         { path: dbxPath, mode: "overwrite", autorename: false, mute: true },
         bytes,
       );
+      this.pathIndex.add(dbxPath);
     } catch (err) {
       throw mapDropboxError(err, path);
     }
@@ -210,6 +212,7 @@ export class DropboxFs {
 
     try {
       await this.client.rpc("/2/files/create_folder_v2", { path: dbxPath });
+      this.pathIndex.add(dbxPath);
     } catch (err) {
       throw mapDropboxError(err, path);
     }
@@ -233,6 +236,7 @@ export class DropboxFs {
 
     try {
       await this.client.rpc("/2/files/delete_v2", { path: dbxPath });
+      this.pathIndex.removeTree(dbxPath);
     } catch (err) {
       if (
         options?.force &&
@@ -254,6 +258,7 @@ export class DropboxFs {
         from_path: fromPath,
         to_path: toPath,
       });
+      this.pathIndex.add(toPath);
     } catch (err) {
       throw mapDropboxError(err, src);
     }
@@ -268,6 +273,7 @@ export class DropboxFs {
         from_path: fromPath,
         to_path: toPath,
       });
+      this.pathIndex.move(fromPath, toPath);
     } catch (err) {
       throw mapDropboxError(err, src);
     }
@@ -280,13 +286,13 @@ export class DropboxFs {
   }
 
   getAllPaths(): string[] {
-    return this.cachedPaths;
+    return this.pathIndex.getAllPaths();
   }
 
   /**
    * Prefetch all file and folder paths via recursive list_folder.
    * Call this before operations that need getAllPaths() (like glob).
-   * Results are cached until the next call to prefetchAllPaths().
+   * Results are replaced on each call.
    */
   async prefetchAllPaths(): Promise<string[]> {
     const dbxPath = this.toPath("/");
@@ -315,7 +321,7 @@ export class DropboxFs {
       throw mapDropboxError(err, "/");
     }
 
-    this.cachedPaths = allPaths;
+    this.pathIndex.load(allPaths);
     return allPaths;
   }
 
@@ -416,6 +422,7 @@ export class DropboxFs {
         throw mapDropboxError(err, originalPath);
       }
     }
+    this.pathIndex.add(dbxPath);
   }
 }
 

@@ -675,28 +675,16 @@ describe("unsupported operations", () => {
 // ─── getAllPaths ──────────────────────────────────────────
 
 describe("getAllPaths", () => {
-  it("returns empty array (sync method cannot do async API calls)", () => {
+  it("returns empty array before prefetch", () => {
     const fs = createFs();
     expect(fs.getAllPaths()).toEqual([]);
   });
 
-  it("returns cached paths after prefetch", async () => {
+  it("returns paths after prefetch", async () => {
     mockRpcResponse({
       entries: [
-        {
-          ".tag": "file",
-          name: "a.txt",
-          id: "id:1",
-          path_display: "/a.txt",
-          path_lower: "/a.txt",
-        },
-        {
-          ".tag": "folder",
-          name: "docs",
-          id: "id:2",
-          path_display: "/docs",
-          path_lower: "/docs",
-        },
+        { ".tag": "file", name: "a.txt", id: "id:1", path_display: "/a.txt" },
+        { ".tag": "folder", name: "docs", id: "id:2", path_display: "/docs" },
       ],
       cursor: "c1",
       has_more: true,
@@ -708,7 +696,6 @@ describe("getAllPaths", () => {
           name: "b.md",
           id: "id:3",
           path_display: "/docs/b.md",
-          path_lower: "/docs/b.md",
         },
       ],
       cursor: "c2",
@@ -723,6 +710,243 @@ describe("getAllPaths", () => {
     expect(paths).toContain("/docs");
     expect(paths).toContain("/docs/b.md");
     expect(paths).toHaveLength(3);
+  });
+
+  it("prefetch replaces previous index", async () => {
+    // First prefetch
+    mockRpcResponse({
+      entries: [
+        {
+          ".tag": "file",
+          name: "old.txt",
+          id: "id:1",
+          path_display: "/old.txt",
+        },
+      ],
+      cursor: "",
+      has_more: false,
+    });
+    const fs = createFs();
+    await fs.prefetchAllPaths();
+    expect(fs.getAllPaths()).toContain("/old.txt");
+
+    // Second prefetch (file deleted externally)
+    mockRpcResponse({
+      entries: [
+        {
+          ".tag": "file",
+          name: "new.txt",
+          id: "id:2",
+          path_display: "/new.txt",
+        },
+      ],
+      cursor: "",
+      has_more: false,
+    });
+    await fs.prefetchAllPaths();
+    expect(fs.getAllPaths()).toContain("/new.txt");
+    expect(fs.getAllPaths()).not.toContain("/old.txt");
+  });
+});
+
+// ─── mutation tracking ─────────────────────────────────────
+
+describe("mutation tracking in getAllPaths", () => {
+  function mockPrefetch(paths: string[]) {
+    mockRpcResponse({
+      entries: paths.map((p, i) => ({
+        ".tag": p.includes(".") ? "file" : "folder",
+        name: p.split("/").pop(),
+        id: `id:${i}`,
+        path_display: p,
+      })),
+      cursor: "",
+      has_more: false,
+    });
+  }
+
+  it("writeFile adds new path", async () => {
+    mockPrefetch(["/a.txt"]);
+    const fs = createFs();
+    await fs.prefetchAllPaths();
+
+    // writeFile
+    mockRpcResponse({ ".tag": "file", name: "b.txt", id: "id:2", size: 5 });
+    await fs.writeFile("/b.txt", "hello");
+
+    expect(fs.getAllPaths()).toContain("/b.txt");
+    expect(fs.getAllPaths()).toContain("/a.txt");
+  });
+
+  it("writeFile without prefetch still adds path", async () => {
+    mockRpcResponse({ ".tag": "file", name: "b.txt", id: "id:1", size: 5 });
+    const fs = createFs();
+    await fs.writeFile("/b.txt", "hello");
+
+    expect(fs.getAllPaths()).toContain("/b.txt");
+  });
+
+  it("rm removes path from index", async () => {
+    mockPrefetch(["/a.txt", "/b.txt"]);
+    const fs = createFs();
+    await fs.prefetchAllPaths();
+
+    // rm (stat first, then delete)
+    mockRpcResponse({ ".tag": "file", name: "a.txt", id: "id:1", size: 5 });
+    mockRpcResponse({
+      metadata: { ".tag": "file", name: "a.txt", id: "id:1" },
+    });
+    await fs.rm("/a.txt");
+
+    expect(fs.getAllPaths()).not.toContain("/a.txt");
+    expect(fs.getAllPaths()).toContain("/b.txt");
+  });
+
+  it("rm -rf removes entire subtree", async () => {
+    mockPrefetch([
+      "/dir",
+      "/dir/a.txt",
+      "/dir/sub",
+      "/dir/sub/b.txt",
+      "/other.txt",
+    ]);
+    const fs = createFs();
+    await fs.prefetchAllPaths();
+
+    // rm -rf (no stat check, straight to delete)
+    mockRpcResponse({
+      metadata: { ".tag": "folder", name: "dir", id: "id:1" },
+    });
+    await fs.rm("/dir", { recursive: true });
+
+    const paths = fs.getAllPaths();
+    expect(paths).not.toContain("/dir");
+    expect(paths).not.toContain("/dir/a.txt");
+    expect(paths).not.toContain("/dir/sub/b.txt");
+    expect(paths).toContain("/other.txt");
+  });
+
+  it("mv updates path in index", async () => {
+    mockPrefetch(["/old.txt"]);
+    const fs = createFs();
+    await fs.prefetchAllPaths();
+
+    mockRpcResponse({
+      metadata: { ".tag": "file", name: "new.txt", id: "id:1" },
+    });
+    await fs.mv("/old.txt", "/new.txt");
+
+    expect(fs.getAllPaths()).toContain("/new.txt");
+    expect(fs.getAllPaths()).not.toContain("/old.txt");
+  });
+
+  it("cp adds destination path without removing source", async () => {
+    mockPrefetch(["/src.txt"]);
+    const fs = createFs();
+    await fs.prefetchAllPaths();
+
+    mockRpcResponse({
+      metadata: { ".tag": "file", name: "copy.txt", id: "id:2" },
+    });
+    await fs.cp("/src.txt", "/copy.txt");
+
+    expect(fs.getAllPaths()).toContain("/src.txt");
+    expect(fs.getAllPaths()).toContain("/copy.txt");
+  });
+
+  it("mkdir adds directory to index", async () => {
+    mockPrefetch(["/a.txt"]);
+    const fs = createFs();
+    await fs.prefetchAllPaths();
+
+    mockRpcResponse({
+      metadata: { ".tag": "folder", name: "newdir", id: "id:2" },
+    });
+    await fs.mkdir("/newdir");
+
+    expect(fs.getAllPaths()).toContain("/newdir");
+  });
+
+  it("mkdir -p adds nested directories", async () => {
+    // Two segment mkdir: /deep then /deep/nested
+    mockRpcResponse({
+      metadata: { ".tag": "folder", name: "deep", id: "id:1" },
+    });
+    mockRpcResponse({
+      metadata: { ".tag": "folder", name: "nested", id: "id:2" },
+    });
+
+    const fs = createFs();
+    await fs.mkdir("/deep/nested", { recursive: true });
+
+    expect(fs.getAllPaths()).toContain("/deep");
+    expect(fs.getAllPaths()).toContain("/deep/nested");
+  });
+});
+
+// ─── error rejection (index stays consistent) ──────────────
+
+describe("failed mutations do not update getAllPaths", () => {
+  function mockPrefetch(paths: string[]) {
+    mockRpcResponse({
+      entries: paths.map((p, i) => ({
+        ".tag": p.includes(".") ? "file" : "folder",
+        name: p.split("/").pop(),
+        id: `id:${i}`,
+        path_display: p,
+      })),
+      cursor: "",
+      has_more: false,
+    });
+  }
+
+  it("failed writeFile does not add path", async () => {
+    mockPrefetch(["/existing.txt"]);
+    const fs = createFs();
+    await fs.prefetchAllPaths();
+
+    mock409("path/not_found/");
+    await expect(fs.writeFile("/fail.txt", "data")).rejects.toThrow();
+
+    expect(fs.getAllPaths()).not.toContain("/fail.txt");
+    expect(fs.getAllPaths()).toContain("/existing.txt");
+  });
+
+  it("failed rm does not remove path", async () => {
+    mockPrefetch(["/keep.txt"]);
+    const fs = createFs();
+    await fs.prefetchAllPaths();
+
+    // stat succeeds (it's a file), then delete fails
+    mockRpcResponse({ ".tag": "file", name: "keep.txt", id: "id:1", size: 5 });
+    mock409("too_many_write_operations/");
+    await expect(fs.rm("/keep.txt")).rejects.toThrow();
+
+    expect(fs.getAllPaths()).toContain("/keep.txt");
+  });
+
+  it("failed mv does not change paths", async () => {
+    mockPrefetch(["/a.txt"]);
+    const fs = createFs();
+    await fs.prefetchAllPaths();
+
+    mock409("to/conflict/file/");
+    await expect(fs.mv("/a.txt", "/b.txt")).rejects.toThrow();
+
+    expect(fs.getAllPaths()).toContain("/a.txt");
+    expect(fs.getAllPaths()).not.toContain("/b.txt");
+  });
+
+  it("failed cp does not add path", async () => {
+    mockPrefetch(["/src.txt"]);
+    const fs = createFs();
+    await fs.prefetchAllPaths();
+
+    mock409("to/conflict/file/");
+    await expect(fs.cp("/src.txt", "/dest.txt")).rejects.toThrow();
+
+    expect(fs.getAllPaths()).not.toContain("/dest.txt");
+    expect(fs.getAllPaths()).toContain("/src.txt");
   });
 });
 

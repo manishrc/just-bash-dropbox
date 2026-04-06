@@ -1,6 +1,6 @@
 {
   "name": "just-bash-dropbox",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Dropbox filesystem adapter for just-bash",
   "repository": {
     "type": "git",
